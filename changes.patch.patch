@@ -1,0 +1,308 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3836abad..3e0e405c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -22,6 +22,7 @@ option(TRITON_BUILD_TUTORIALS "Build C++ Triton tutorials" ON)
+ option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
+ option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
+ option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
++option(TRITON_BUILD_WITH_ALL_LLVM_COMPONENTS "Build C++ Triton with all llvm components" ON)
+ option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
+ set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
+ 
+@@ -288,6 +289,12 @@ if(TRITON_BUILD_PYTHON_MODULE)
+                   ${PYTHON_SRC_PATH}/llvm.cc)
+ 
+   # Link triton with its dependencies
++  if (TRITON_BUILD_WITH_ALL_LLVM_COMPONENTS)
++    execute_process(COMMAND llvm-config --libfiles
++                    OUTPUT_VARIABLE LLVM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
++    string(REPLACE " " ";" LLVM_LIBS "${LLVM_LIBS}")
++    list(APPEND TRITON_LIBRARIES ${LLVM_LIBS})
++  endif()
+   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
+   if(WIN32)
+     target_link_libraries(triton PRIVATE ${CMAKE_DL_LIBS})
+
+diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
+index f70c46a9..5700ab53 100644
+--- a/python/triton/compiler/compiler.py
++++ b/python/triton/compiler/compiler.py
+@@ -388,7 +388,7 @@ class CompiledKernel:
+             return
+         device = driver.active.get_current_device()
+         # create launcher
+-        self.run = driver.active.launcher_cls(self.src, self.metadata)
++        self.run = driver.active.launcher_cls(self.src, self.metadata, self.name)
+         # not enough shared memory to run the kernel
+         max_shared = driver.active.utils.get_device_properties(device)["max_shared_mem"]
+         if self.metadata.shared > max_shared:
+@@ -430,4 +430,4 @@ class CompiledKernel:
+             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
+                      CompiledKernel.launch_enter_hook, CompiledKernel.launch_exit_hook, *args)
+ 
+-        return runner
++        return runner
+\ No newline at end of file
+diff --git a/python/triton/runtime/jit.py b/python/triton/runtime/jit.py
+index 1db10dee..227cbf97 100644
+--- a/python/triton/runtime/jit.py
++++ b/python/triton/runtime/jit.py
+@@ -635,6 +635,19 @@ class JITFunction(KernelInterface[T]):
+             self.cache[device_key][key] = kernel
+             self._call_hook(key, signature, device, constants, options, configs, warmup, before=False)
+ 
++        launcher_src_dir = os.getenv("KERNEL_AUX_FILE_DIR")
++        if launcher_src_dir is not None:
++            os.makedirs(launcher_src_dir, mode=0o777, exist_ok=True)
++            ttcir_path = os.path.join(launcher_src_dir, kernel.name + ".ttcir")
++            tttcir_path = os.path.join(launcher_src_dir, kernel.name + ".tttcir")
++            llir_path = os.path.join(launcher_src_dir, kernel.name + ".llir")
++            with open(ttcir_path, "w") as f:
++                f.write(kernel.asm["ttcir"])
++            with open(tttcir_path, "w") as f:
++                f.write(kernel.asm["tttcir"])
++            with open(llir_path, "w") as f:
++                f.write(kernel.asm["llir"])
++
+         # Check that used global values have not changed.
+         not_present = object()
+         for (name, _), (val, globals_dict) in self.used_global_vals.items():
+@@ -959,4 +972,4 @@ def get_jit_fn_file_line(fn):
+         if line.strip().startswith("def "):
+             begin_line += idx
+             break
+-    return file_name, begin_line
++    return file_name, begin_line
+\ No newline at end of file
+diff --git a/python/tutorials/05-layer-norm.py b/python/tutorials/05-layer-norm.py
+index 6726ae72..6fd917c0 100644
+--- a/python/tutorials/05-layer-norm.py
++++ b/python/tutorials/05-layer-norm.py
+@@ -149,6 +149,8 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
+     DX += row * stride
+     # Offset locks and weights/biases gradient pointer for parallel reduction
+     lock_id = row % GROUP_SIZE_M
++    # GROUP_SIZE_M contains multiple rows
++
+     Lock += lock_id
+     Count = Lock + GROUP_SIZE_M
+     DW = DW + lock_id * N + cols
+@@ -172,6 +174,7 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
+     # Accumulate partial sums for dw/db
+     partial_dw = (dy * xhat).to(w.dtype)
+     partial_db = (dy).to(w.dtype)
++    # Get the lock
+     while tl.atomic_cas(Lock, 0, 1) == 1:
+         pass
+     count = tl.load(Count)
+@@ -179,7 +182,7 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
+     if count == 0:
+         tl.atomic_xchg(Count, 1)
+     else:
+-        partial_dw += tl.load(DW, mask=mask)
++        partial_dw += tl.load(DW, mask=mask) # accmulate the DWs belonging to the same lock_id or group_od
+         partial_db += tl.load(DB, mask=mask)
+     tl.store(DW, partial_dw, mask=mask)
+     tl.store(DB, partial_db, mask=mask)
+@@ -192,7 +195,7 @@ def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
+                          DB,  # pointer to the partial sum of biases gradient
+                          FINAL_DW,  # pointer to the weights gradient
+                          FINAL_DB,  # pointer to the biases gradient
+-                         M,  # GROUP_SIZE_M
++                         M,  # GROUP_SIZE_M: a group is composed of M rows
+                          N,  # number of columns
+                          BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+     # Map the program id to the elements of DW and DB it should compute.
+@@ -248,6 +251,9 @@ class LayerNorm(torch.autograd.Function):
+             BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
+         ctx.save_for_backward(x, weight, bias, mean, rstd)
+         ctx.BLOCK_SIZE = BLOCK_SIZE
++        # What is a warp and num_ctas? Why do we need it in CPU?
++          # warp: a group of threads in CPU/GPU, e.g. a warp is composed of 32 threads in GPU
++          # num_ctas: the number of blocks in a block cluster
+         ctx.num_warps = num_warps
+         ctx.eps = eps
+         return y
+@@ -288,7 +294,7 @@ class LayerNorm(torch.autograd.Function):
+ 
+ 
+ layer_norm = LayerNorm.apply
+-device = triton.runtime.driver.active.get_current_target().backend
++device = triton.runtime.driver.active.get_current_target().backend # TRITON_CPU_BACKEND=1 to set the device as CPU
+ # Torch doesn't support operations in float16 on CPU so use float32 instead
+ dtype = torch.float32 if device == 'cpu' else torch.float16
+ 
+diff --git a/third_party/cpu/backend/compiler.py b/third_party/cpu/backend/compiler.py
+index ad26f6d3..c9519d9b 100644
+--- a/third_party/cpu/backend/compiler.py
++++ b/third_party/cpu/backend/compiler.py
+@@ -287,4 +287,4 @@ class CPUBackend(BaseBackend):
+         # Right now it would only return a simple string like "x86_64" or "aarch64".
+         import platform
+ 
+-        return f"{platform.machine()}"
++        return f"{platform.machine()}"
+\ No newline at end of file
+diff --git a/third_party/cpu/backend/driver.py b/third_party/cpu/backend/driver.py
+index 3308fd23..8a5321b3 100644
+--- a/third_party/cpu/backend/driver.py
++++ b/third_party/cpu/backend/driver.py
+@@ -37,20 +37,42 @@ if os.path.exists(sys_lib_dir):
+     library_dirs.append(sys_lib_dir)
+ 
+ 
+-def compile_module_from_src(src, name):
++def compile_module_from_src(inc, src, src_host, kernel_name):
++    launcher_include_dir = os.getenv("KERNEL_LAUNCHER_INCLUDE_DIR")
++    launcher_src_dir = os.getenv("KERNEL_AUX_FILE_DIR")
++    if launcher_include_dir is None:
++       launcher_include_dir = tempfile.mkdtemp()
++
++    os.makedirs(launcher_include_dir, mode=0o777, exist_ok=True)
++
++    if launcher_src_dir is None:
++       launcher_src_dir = launcher_include_dir
++
++    os.makedirs(launcher_src_dir, mode=0o777, exist_ok=True)
++
++    # print("launcher include dir: ", launcher_include_dir)
++    # print("launcher src dir: ", launcher_src_dir)
++    inc_path = os.path.join(launcher_include_dir, kernel_name+"_launcher.h")
++    with open(inc_path, "w") as f:
++        f.write(inc)
++
++    src_path = os.path.join(launcher_src_dir, kernel_name+"_launcher.cpp")
++    with open(src_path, "w") as f:
++        f.write(src)
++
+     key = hashlib.md5(src.encode("utf-8")).hexdigest()
+     cache = get_cache_manager(key)
+-    cache_path = cache.get_file(f"{name}.so")
++    cache_path = cache.get_file("__triton_cpu_launcher.so")
+     if cache_path is None:
+         with tempfile.TemporaryDirectory() as tmpdir:
+-            src_path = os.path.join(tmpdir, "main.cpp")
+-            with open(src_path, "w") as f:
+-                f.write(src)
+-            so = _build(name, src_path, tmpdir, library_dirs, include_dirs, libraries)
++            src_host_path = os.path.join(tmpdir, "main.cpp")
++            with open(src_host_path, "w") as f:
++                f.write(src_host)
++            so = _build("__triton_cpu_launcher", src_host_path, tmpdir, library_dirs, include_dirs, libraries)
+             with open(so, "rb") as f:
+-                cache_path = cache.put(f.read(), f"{name}.so", binary=True)
++                cache_path = cache.put(f.read(), "__triton_cpu_launcher.so", binary=True)
+     import importlib.util
+-    spec = importlib.util.spec_from_file_location(name, cache_path)
++    spec = importlib.util.spec_from_file_location("__triton_cpu_launcher", cache_path)
+     mod = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(mod)
+     return mod
+@@ -112,7 +134,7 @@ def ty_to_cpp(ty):
+     }[ty]
+ 
+ 
+-def make_launcher(constants, signature, ids):
++def make_launcher(constants, signature, ids, kernel_name):
+     # Record the end of regular arguments;
+     # subsequent arguments are architecture-specific descriptors.
+     arg_decls = ', '.join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+@@ -145,8 +167,8 @@ def make_launcher(constants, signature, ids):
+     kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
+     kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_fn_args] + ["uint32_t"] * 6)
+ 
+-    # generate glue code
+-    src = f"""
++    # host source code
++    src_host = f"""
+ #include <algorithm>
+ #include <cmath>
+ #include <cstddef>
+@@ -351,19 +373,75 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
+   return m;
+ }}
+ """
+-    return src
++
++    inc = f"""
++#include <stdint.h>
++#include <cstddef>
++using {kernel_name}_kernel_ptr_t = void(*)({kernel_fn_arg_types});
++extern "C"{{
++// Pointer type (=Memref) becomes int64_t + MemRef struct
++// FIXME: understand what this int64_t is used for.
++void({kernel_name})({kernel_fn_arg_types});
++}}
++
++void {kernel_name}_wrap(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads,
++                        {kernel_name}_kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''});
++    """
++    
++    src = f"""
++#include "{kernel_name}_launcher.h"
++#include "support/omp.h"
++#include "support/support.h"
++#include <algorithm>
++#include <optional>
++#include <stdio.h>
++
++void {kernel_name}_wrap(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, {kernel_name}_kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
++    // TODO: Consider using omp collapse(3) clause for simplicity?
++    size_t N = gridX * gridY * gridZ;
++    if (N == 1) {{
++        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} 0, 0, 0, 1, 1, 1);
++        return;
++    }}
++    auto all_grids = get_all_grids(gridX, gridY, gridZ);
++    int omp_max_threads = 1;
++#ifdef _OPENMP
++    omp_max_threads = omp_get_max_threads();
++#endif // _OPENMP
++    int max_threads = (num_threads > 0) ? num_threads : omp_max_threads;
++
++    // Don't pay OMP overhead price when a single thread is used.
++    if (max_threads == 1) {{
++        for (size_t i = 0; i < N; ++i) {{
++        const auto [x, y, z] = all_grids[i];
++        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
++        }}
++        return;
++    }}
++
++    // For now, use the default chunk size, total iterations / max_threads.
++#ifdef _OPENMP
++#pragma omp parallel for schedule(static) num_threads(max_threads)
++#endif // _OPENMP
++    for (size_t i = 0; i < N; ++i) {{
++        const auto [x, y, z] = all_grids[i];
++        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
++    }}
++}}
++    """
++    return inc, src, src_host
+ 
+ 
+ class CPULauncher(object):
+ 
+-    def __init__(self, src, metadata):
++    def __init__(self, src, metadata, kernel_name):
+         ids = {"ids_of_const_exprs": src.fn.constexprs if hasattr(src, "fn") else tuple()}
+         constants = src.constants if hasattr(src, "constants") else dict()
+         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
+         constants = {cst_key(key): value for key, value in constants.items()}
+         signature = {cst_key(key): value for key, value in src.signature.items()}
+-        src = make_launcher(constants, signature, ids)
+-        mod = compile_module_from_src(src, "__triton_cpu_launcher")
++        inc, src, src_host = make_launcher(constants, signature, ids, kernel_name)
++        mod = compile_module_from_src(inc, src, src_host, kernel_name) #"__triton_cpu_launcher"
+         self.launch = mod.launch
+ 
+     def __call__(self, *args, **kwargs):
+@@ -466,4 +544,4 @@ class CPUDriver(DriverBase):
+ 
+         # A typical LLC size for high-end server CPUs are ~400MB.
+         cache_size = 512 * 1024 * 1024
+-        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cpu')
++        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cpu')
+\ No newline at end of file
