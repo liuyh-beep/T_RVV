@@ -12,7 +12,6 @@ blk_values=""
 
 # Build directories
 BUILD_DIR="../benchmark/build"
-KERNEL_LAUNCHER_INCLUDE_DIR=${BUILD_DIR}/launcher/include
 LLVM_BUILD_DIR="/llvm-project/build"
 RISCV_GNU_TOOLCHAIN_DIR="/opt/riscv"
 
@@ -26,6 +25,18 @@ usage() {
     echo "  -g      Enable debug mode"
     echo "  -v      Enable vectorization"
     exit 1
+}
+
+
+create_dir_if_not_exists() {
+    local dir="$1"
+    if [ ! -d "$dir" ]; then
+        echo "Creating directory: $dir"
+        mkdir -p "$dir" || {
+            echo "Error: Failed to create directory: $dir"
+            exit 1
+        }
+    fi
 }
 
 # Parse command line arguments
@@ -91,6 +102,23 @@ if [ -z "$blk_values" ]; then
 fi
 
 
+if [ "$KERNEL_TYPE" = "triton" ]; then
+    LIB_DIR="${BUILD_DIR}/lib/triton"
+    OBJ_DIR="${BUILD_DIR}/obj/triton"
+    BIN_DIR="${BUILD_DIR}/bin/triton"
+elif [ "$KERNEL_TYPE" = "c" ]; then
+    LIB_DIR="${BUILD_DIR}/lib/c"
+    OBJ_DIR="${BUILD_DIR}/obj/c"
+    BIN_DIR="${BUILD_DIR}/bin/c"
+fi
+
+KERNEL_LAUNCHER_INCLUDE_DIR=${BUILD_DIR}/launcher/include
+
+create_dir_if_not_exists "$KERNEL_LAUNCHER_INCLUDE_DIR"
+create_dir_if_not_exists "$OBJ_DIR"
+create_dir_if_not_exists "$BIN_DIR"
+create_dir_if_not_exists "$LIB_DIR"
+
 # Setup compiler flags
 DEBUG_FLAG=""
 [ $DEBUG_MODE -eq 1 ] && DEBUG_FLAG="-g"
@@ -134,9 +162,6 @@ fi
 
 build_c_kernel() {
     KERNEL_ENABLE="C_KERNEL_ENABLE"
-    LIB_DIR="${BUILD_DIR}/lib/gcc"
-    BIN_DIR="${BUILD_DIR}/bin/gcc"
-    OBJ_DIR="${BUILD_DIR}/obj/gcc"
 
     ${CLANGPP} -fPIC \
         -I ${BUILD_DIR}/../../env_build/include \
@@ -167,10 +192,6 @@ build_c_kernel() {
 
 build_triton_kernel() {
     KERNEL_ENABLE="TRITON_KERNEL_ENABLE"
-    LIB_DIR="${BUILD_DIR}/lib/triton"
-    OBJ_DIR="${BUILD_DIR}/obj/triton"
-    BIN_DIR="${BUILD_DIR}/bin/triton"
-
 
     ${CLANGPP} -fPIC -I ${BUILD_DIR}/../../env_build/include -c ${BUILD_DIR}/../src/support/*.cpp -o ${OBJ_DIR}/support.o
     ${AR} rcs ${LIB_DIR}/libsupport.a ${OBJ_DIR}/support.o
